@@ -17,7 +17,6 @@ import os
 import numpy as np
 import joblib
 import streamlit as st
-import tensorflow as tf
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page configuration  (must be first Streamlit call)
@@ -216,50 +215,46 @@ st.markdown(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load artefacts
+# Load artefacts  (NO TensorFlow — pure numpy inference)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_artefacts():
     base = os.path.dirname(__file__)
-    scaler_path = os.path.join(base, "scaler.pkl")
+    weights_path = os.path.join(base, "model_weights.npy")
+    scaler_path  = os.path.join(base, "scaler.pkl")
 
-    # Try both model formats
-    model_path = None
-    for candidate in ["model.keras", "model.h5"]:
-        p = os.path.join(base, candidate)
-        if os.path.exists(p):
-            model_path = p
-            break
-
-    if model_path is None:
-        st.error(
-            "❌  **No model file found.**  "
-            "Please run this in your notebook and push to GitHub:\n\n"
-            "```python\nmodel.save('../../model.keras')\n```"
-        )
+    if not os.path.exists(weights_path):
+        st.error("❌ **model_weights.npy not found.** Push it to GitHub.")
         st.stop()
     if not os.path.exists(scaler_path):
-        st.error(
-            "❌  **scaler.pkl not found.**  "
-            "Please run this in your notebook and push to GitHub:\n\n"
-            "```python\nimport joblib\njoblib.dump(scaler, '../../scaler.pkl')\n```"
-        )
+        st.error("❌ **scaler.pkl not found.** Push it to GitHub.")
         st.stop()
 
-    model  = tf.keras.models.load_model(model_path)
-    scaler = joblib.load(scaler_path)
-    return model, scaler
+    weights = list(np.load(weights_path, allow_pickle=True))
+    scaler  = joblib.load(scaler_path)
+    return weights, scaler
 
-model, scaler = load_artefacts()
+weights, scaler = load_artefacts()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure-numpy forward pass
+# Architecture (from Keras Tuner):
+#   Dense(85, relu) → Dropout(skip at inference)
+#   Dense(8,  relu) → Dropout(skip at inference)
+#   Dense(1,  sigmoid)
+# Weights: W0(8,85) b0(85) | W1(85,8) b1(8) | W2(8,1) b2(1)
+# ─────────────────────────────────────────────────────────────────────────────
+def _relu(x):    return np.maximum(0.0, x)
+def _sigmoid(x): return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+def numpy_predict(x, w):
+    h = _relu(x @ w[0] + w[1])   # Dense 85
+    h = _relu(h @ w[2] + w[3])   # Dense 8
+    return float(_sigmoid(h @ w[4] + w[5])[0][0])   # Dense 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Preprocessing helper
-# These medians were computed on the *full* dataset (by outcome group) in
-# eda.ipynb. We reproduce them here for inference-time imputation.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Imputation medians: {feature: {0: median_for_nondiabetic, 1: median_for_diabetic}}
-# Values are read directly from the dataset in the notebook.
 IMPUTATION_MEDIANS = {
     "Glucose":       {0: 107.0,  1: 140.0},
     "BloodPressure": {0: 70.0,   1: 74.0},
@@ -267,51 +262,33 @@ IMPUTATION_MEDIANS = {
     "Insulin":       {0: 102.5,  1: 169.5},
     "BMI":           {0: 30.1,   1: 34.3},
 }
+IQR_CAPS = {
+    "Insulin": (0.0, 318.0),
+    "BMI":     (18.2, 47.39),
+    "DPF":     (0.078, 1.2),
+}
 
 def preprocess_input(pregnancies, glucose, blood_pressure,
-                     skin_thickness, insulin, bmi,
-                     dpf, age):
-    """
-    Mirror the notebook preprocessing:
-    1. Replace impossible zero values with group‑median estimates
-       (we use the mean of both group medians as an unbiased prior
-        since we cannot know the true label at inference time).
-    2. Apply IQR outlier capping (thresholds from the dataset).
-    3. Scale with the fitted StandardScaler.
-    """
-
-    # Step 1 – Impute zeros
-    def safe(val, feature):
+                     skin_thickness, insulin, bmi, dpf, age):
+    def safe(val, feat):
         if val == 0:
-            m0 = IMPUTATION_MEDIANS[feature][0]
-            m1 = IMPUTATION_MEDIANS[feature][1]
-            return (m0 + m1) / 2.0  # neutral prior
+            return (IMPUTATION_MEDIANS[feat][0] + IMPUTATION_MEDIANS[feat][1]) / 2.0
         return float(val)
 
-    glucose       = safe(glucose,       "Glucose")
-    blood_pressure= safe(blood_pressure,"BloodPressure")
-    skin_thickness= safe(skin_thickness,"SkinThickness")
-    insulin       = safe(insulin,       "Insulin")
-    bmi           = safe(bmi,           "BMI")
+    glucose        = safe(glucose,        "Glucose")
+    blood_pressure = safe(blood_pressure, "BloodPressure")
+    skin_thickness = safe(skin_thickness, "SkinThickness")
+    insulin        = safe(insulin,        "Insulin")
+    bmi            = safe(bmi,            "BMI")
 
-    # Step 2 – IQR capping (pre‑computed bounds from the full dataset)
-    IQR_CAPS = {
-        "Insulin":                  (  0.0, 318.0),
-        "BMI":                      ( 18.2,  47.39),
-        "DiabetesPedigreeFunction": (  0.078, 1.2),
-    }
-    def cap(val, lo, hi):
-        return float(np.clip(val, lo, hi))
+    insulin = float(np.clip(insulin, *IQR_CAPS["Insulin"]))
+    bmi     = float(np.clip(bmi,     *IQR_CAPS["BMI"]))
+    dpf     = float(np.clip(dpf,     *IQR_CAPS["DPF"]))
 
-    insulin = cap(insulin, *IQR_CAPS["Insulin"])
-    bmi     = cap(bmi,     *IQR_CAPS["BMI"])
-    dpf     = cap(dpf,     *IQR_CAPS["DiabetesPedigreeFunction"])
+    raw    = np.array([[pregnancies, glucose, blood_pressure,
+                        skin_thickness, insulin, bmi, dpf, age]], dtype=float)
+    return scaler.transform(raw)
 
-    # Step 3 – Scale
-    raw = np.array([[pregnancies, glucose, blood_pressure,
-                     skin_thickness, insulin, bmi, dpf, age]], dtype=float)
-    scaled = scaler.transform(raw)
-    return scaled
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,7 +407,7 @@ if st.button("🔬 Predict Diabetes Risk", use_container_width=True):
             pregnancies, glucose, blood_pressure,
             skin_thickness, insulin, bmi, dpf, age,
         )
-        prob = float(model.predict(X_scaled, verbose=0)[0][0])
+        prob = numpy_predict(X_scaled, weights)
         is_diabetic = prob >= 0.5
 
     # ── Result card ──────────────────────────────────────────────────────────

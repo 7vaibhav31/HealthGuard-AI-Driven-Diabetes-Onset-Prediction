@@ -15,7 +15,6 @@ Run with:
 
 import os
 import numpy as np
-import pandas as pd
 import joblib
 import streamlit as st
 import tensorflow as tf
@@ -221,19 +220,29 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_artefacts():
-    model_path  = os.path.join(os.path.dirname(__file__), "model.keras")
-    scaler_path = os.path.join(os.path.dirname(__file__), "scaler.pkl")
+    base = os.path.dirname(__file__)
+    scaler_path = os.path.join(base, "scaler.pkl")
 
-    if not os.path.exists(model_path):
+    # Try both model formats
+    model_path = None
+    for candidate in ["model.keras", "model.h5"]:
+        p = os.path.join(base, candidate)
+        if os.path.exists(p):
+            model_path = p
+            break
+
+    if model_path is None:
         st.error(
-            "❌  **model.keras not found.**  "
-            "Please run the save cells in your notebook (eda.ipynb) to export the model."
+            "❌  **No model file found.**  "
+            "Please run this in your notebook and push to GitHub:\n\n"
+            "```python\nmodel.save('../../model.keras')\n```"
         )
         st.stop()
     if not os.path.exists(scaler_path):
         st.error(
             "❌  **scaler.pkl not found.**  "
-            "Please run the save cells in your notebook (eda.ipynb) to export the scaler."
+            "Please run this in your notebook and push to GitHub:\n\n"
+            "```python\nimport joblib\njoblib.dump(scaler, '../../scaler.pkl')\n```"
         )
         st.stop()
 
